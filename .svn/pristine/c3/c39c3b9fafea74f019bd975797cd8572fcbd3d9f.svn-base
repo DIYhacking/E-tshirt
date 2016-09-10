@@ -1,0 +1,98 @@
+#include "stm32l_rtc.h"
+#include <hal.h>
+#include <ch.h>
+#include <stm32l1xx.h>
+
+void rtc_init()
+{
+    // Allow RTC write
+    RTC->WPR = 0xCA;
+    RTC->WPR = 0x53;
+    
+    // Enter RTC init mode
+    RTC->ISR |= RTC_ISR_INIT;
+    chThdSleepMilliseconds(10);
+    
+    // Program clock frequency (32.768kHz crystal)
+    // Reference manual says to write the prescalers in two operations..
+    RTC->PRER = 0x007F0000;
+    RTC->PRER = 0x007F00FF;
+    
+    // Program the date and time
+    RTC->DR = (
+        ((1) << 20) | // Year tens
+        ((3) << 16) | // Year units
+        ((0) << 13) | // Day of week
+        ((0) << 12) | // Month tens
+        ((1) << 8) | // Month units
+        ((0) << 4) | // Day tens
+        ((1) << 0) // Day units
+    );
+    
+    RTC->TR = 0;
+    
+    // Start the RTC
+    RTC->ISR &= ~RTC_ISR_INIT;
+    
+    chThdSleepMilliseconds(10); // Wait for RTC to start
+}
+
+int rtc_get()
+{
+    int tr = RTC->TR;
+    int dr = RTC->DR;
+    
+    int day = ((dr >> 4) & 0x3) * 10 + ((dr >> 0) & 0xF);
+    int hour = ((tr >> 20) & 0x3) * 10 + ((tr >> 16) & 0xF);
+    int minute = ((tr >> 12) & 0x7) * 10 + ((tr >> 8) & 0xF);
+    int second = ((tr >> 4) & 0x7) * 10 + ((tr >> 0) & 0xF);
+    
+    return (day - 1) * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+void rtc_sleep(int timeout_msec)
+{
+    // Allow RTC write
+    RTC->WPR = 0xCA;
+    RTC->WPR = 0x53;
+    
+    int delay = timeout_msec * 2048 / 1000;
+    chDbgAssert((delay > 0 && delay < 65536), "RTC delay", "")
+    
+    while (!(RTC->ISR & RTC_ISR_WUTWF))
+        RTC->CR &= ~RTC_CR_WUTE;
+    
+    RTC->CR &= (~7); // Wakeup clock = RTC/16
+    RTC->WUTR = delay;
+    
+    // Start the wakeup timer
+    PWR->CR |= PWR_CR_CWUF;
+    RTC->ISR &= ~RTC_ISR_WUTF;
+    RTC->CR |= RTC_CR_WUTE | RTC_CR_WUTIE;
+    
+    // Enable EXTI0 on GPIOA for buttons
+    SYSCFG->EXTICR[0] &= ~15;
+    
+    // Enable EXTI0 and EXTI20 rising edge events
+    EXTI->EMR |= EXTI_EMR_MR0 | EXTI_EMR_MR20;
+    EXTI->RTSR |= EXTI_RTSR_TR0 | EXTI_RTSR_TR20;
+    EXTI->PR |= EXTI_PR_PR0 | EXTI_PR_PR20;
+    
+    // Go to sleep
+    PWR->CR |= PWR_CR_LPSDSR;
+    PWR->CR &= ~PWR_CR_PDDS;
+    SCB->SCR |= SCB_SCR_SLEEPDEEP;
+    asm("dsb");
+    asm("wfe");
+    SCB->SCR &= ~SCB_SCR_SLEEPDEEP;
+    
+    // Switch back to HSI oscillator
+    stm32_clock_init();
+    
+    // Re-enable access to backup domain
+    PWR->CR |= PWR_CR_DBP;
+    
+    RTC->CR &= ~RTC_CR_WUTE;
+    RTC->ISR &= ~RTC_ISR_WUTF;
+    RTC->WPR = 0; // Relock registers
+}

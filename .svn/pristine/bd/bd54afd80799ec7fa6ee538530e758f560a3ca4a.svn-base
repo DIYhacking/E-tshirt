@@ -1,0 +1,57 @@
+#include "main_logic.h"
+#include <ch.h>
+#include <hal.h>
+#include "display.h"
+#include "buttons.h"
+#include "alarm_task.h"
+#include "sensor_task.h"
+#include "stm32l_rtc.h"
+#include "powersave.h"
+
+static int g_alarm_limit = 80;
+
+void main_logic_init()
+{
+    sensor_reset_timestamp();
+    display_clear();
+    display_update_temperature();
+    display_set_alarm(g_alarm_limit);
+    alarm_set_limit(g_alarm_limit * 1000);
+}
+
+void main_logic_step()
+{
+    buttons_t buttons;
+    
+    do {
+        buttons = buttons_read_buffer();
+    
+        if (buttons == BT_PLUS)
+        {
+            g_alarm_limit++;
+        }
+        else if (buttons == BT_MINUS)
+        {
+            g_alarm_limit--;
+        }
+        else if (buttons == BT_CLEAR)
+        {
+            sensor_reset_timestamp();
+            display_clear();
+        }
+        else if (buttons == BT_POWER || powersave_should_sleep())
+        {
+            powersave_sleep();
+        }
+    } while (buttons != BT_NONE);
+    
+    if (g_alarm_limit < -50)
+        g_alarm_limit = -50;
+    else if (g_alarm_limit > 250)
+        g_alarm_limit = 250;
+    
+    display_set_alarm(g_alarm_limit);
+    alarm_set_limit(g_alarm_limit * 1000);
+    display_update_temperature();
+    display_partial_redraw();
+}

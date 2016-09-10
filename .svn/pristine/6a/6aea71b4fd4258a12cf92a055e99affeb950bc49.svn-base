@@ -1,0 +1,56 @@
+#include <ch.h>
+#include <hal.h>
+#include <shell.h>
+#include <gfx.h>
+#include "shell_commands.h"
+#include "usb_usart.h"
+#include "buttons.h"
+#include "sensor_task.h"
+#include "stm32l_rtc.h"
+#include "display.h"
+#include "beeper.h"
+#include "alarm_task.h"
+#include "main_logic.h"
+
+int main()
+{
+    SYSCFG->PMC = 0;
+    halInit();
+    chSysInit();
+    
+    shellInit();
+    gfxInit();
+    gdispSetPowerMode(powerOff);
+    
+#if ENABLE_DEBUG
+    DBGMCU->CR |= DBGMCU_CR_DBG_SLEEP | DBGMCU_CR_DBG_STOP;
+#endif
+    
+    DBGMCU->APB1FZ = 0xFFFFFFFF;
+    DBGMCU->APB2FZ = 0xFFFFFFFF;
+    
+    // Enable watchdog (reset is done by button task)
+    IWDG->KR = 0x5555; // Enable watchdog register write
+    IWDG->PR = 6;
+    IWDG->RLR = 4095; // 30 seconds
+    IWDG->KR = 0xCCCC; // Start watchdog
+    
+    rtc_init();
+    beeper_init();
+    display_init();
+    sensor_start();
+    buttons_start();
+    alarm_start();
+    
+    adcStart(&ADCD1, NULL);
+    
+    main_logic_init();
+    
+    while (1)
+    {
+       check_usb_usart();
+       chThdSleepMilliseconds(50);
+       
+       main_logic_step();
+    }
+}

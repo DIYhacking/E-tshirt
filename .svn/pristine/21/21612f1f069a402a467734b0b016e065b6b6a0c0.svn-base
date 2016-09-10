@@ -1,0 +1,224 @@
+#include "sensor_task.h"
+#include <ch.h>
+#include <hal.h>
+#include "stm32l_rtc.h"
+#include "ntc.h"
+
+#define MAX_INTERVAL 60
+#define MIN_INTERVAL 20
+#define MAX_DEADTIME 120
+
+volatile static int g_temperature;
+volatile static int g_timestamp = -1;
+volatile static bool g_wireless;
+
+bool sensor_get_temperature(int *temperature, int *timestamp, bool *wireless)
+{
+    chSysLock();
+    *temperature = g_temperature;
+    *timestamp = g_timestamp;
+    *wireless = g_wireless;
+    chSysUnlock();
+    
+    int now = rtc_get();
+    if (*timestamp < 0 || *timestamp < now - MAX_DEADTIME)
+        return false;
+    
+    return true;
+}
+
+void sensor_reset_timestamp()
+{
+    int oldnow = rtc_get();
+    
+    rtc_init();
+    chSysLock();
+    if (g_timestamp < 0 || g_timestamp < oldnow - MAX_DEADTIME)
+    {
+        g_timestamp = -1;
+    }
+    else
+    {
+        g_timestamp = 0;
+    }
+    chSysUnlock();
+}
+
+/* Check if the NTC sensor is connected, and if it is, update the reading. */
+static bool check_ntc()
+{
+    int temp = ntc_read();
+    
+    if (temp < -50000 || temp > 300000)
+        return false;
+    
+    int time = rtc_get();
+    chSysLock();
+    g_temperature = temp;
+    g_timestamp = time;
+    g_wireless = false;
+    chSysUnlock();
+    
+    return true;
+}
+
+/* Read until one reading has been received correctly, or the timeout passes. */
+static bool handle_rf_packets()
+{
+    int i = -1, c;
+    uint8_t packet[3];
+    int reading = -9999;
+    systime_t starttime = chTimeNow();
+    
+    /* Each packet consists of 4 bytes:
+     * 11001100 HLHLHLHL HLHLHLHL HLHLHLHL
+     * 
+     * The first byte is the constant start character 0xCC.
+     * The rest of the bytes have two interleaved words, H and L, where
+     * H is the inverse of L. This is done to keep DC offset of the signal
+     * at zero, and to provide an error check.
+     * 
+     * The value of L is the temperature in celcius, in 8.4 fixed point format.
+     */
+    
+    while (chTimeNow() - starttime < S2ST(MAX_DEADTIME) &&
+           !chThdShouldTerminate())
+    {
+        c = sdGetTimeout(&SD1, MS2ST(100));
+        
+        if (c < 0 && ntc_connected())
+            return false;
+        
+        if (c == 0xCC)
+        {
+            i = 0; /* Start of packet */
+        }
+        else if (i >= 0)
+        {
+            packet[i++] = c;
+            
+            if (i == 3)
+            {
+                /* Last byte of packet received, parse it. */
+                int v = packet[0] | (packet[1] << 8) | (packet[2] << 16);
+                int low = v & 0x555555;
+                int high = ((v & 0xAAAAAA) >> 1) ^ 0x555555;
+                
+                if (low == high)
+                {
+                    /* Packet is valid, collect the bits */
+                    int temp = 0;
+                    for (int j = 0; j < 12; j++)
+                    {
+                        temp |= ((v >> (j * 2)) & 1) << j;
+                    }
+                    temp = (int16_t)(temp << 4);
+                    temp = temp * 1000 / 256;
+                    
+                    if (reading == temp)
+                    {
+                        // Ok, got two equal packets
+                        int time = rtc_get();
+                        
+                        chSysLock();
+                        g_temperature = temp;
+                        g_timestamp = time;
+                        g_wireless = true;
+                        chSysUnlock();
+                    
+                        return true;
+                    }
+                    else
+                    {
+                        // Wait for another packet to confirm
+                        reading = temp;
+                    }
+                }
+                
+                i = -1;
+            }
+        }
+    }
+    
+    return false;
+}
+
+static const SerialConfig config = {
+    2400,
+    0,
+    USART_CR2_STOP1_BITS | USART_CR2_LINEN,
+    0
+};
+
+static Thread *sensorThread = 0;
+static WORKING_AREA(sensorThread_wa, 256);
+
+static msg_t sensor_task(void *arg)
+{
+    chRegSetThreadName("sensor");
+    
+    sdStart(&SD1, &config);
+    
+    while (!chThdShouldTerminate())
+    {
+        int sleep = 5;
+        if (ntc_connected())
+        {
+            check_ntc();
+        }
+        else
+        {
+            if (!g_wireless)
+            {
+                chSysLock();
+                g_timestamp = -1;
+                chSysUnlock();
+            }
+            
+            palSetPad(GPIOA, GPIOA_RF_POWER);
+            bool status = handle_rf_packets();
+            palClearPad(GPIOA, GPIOA_RF_POWER);
+            
+            if (status)
+            {
+                // After successful read, we can sleep a bit longer
+                sleep = MIN_INTERVAL;
+            }
+            else
+            {
+                sleep = 0;
+            }
+        }
+        
+        // Sleep while monitoring any requests to shut down the thread
+        for (int i = 0; i < sleep * 10; i++)
+        {
+            chThdSleepMilliseconds(100);
+            if (chThdShouldTerminate())
+                break;
+        }
+    }
+    
+    sdStop(&SD1);
+    
+    return 0;
+}
+
+void sensor_start()
+{
+    if (sensorThread != NULL)
+        return;
+    
+    sensorThread = chThdCreateStatic(sensorThread_wa, sizeof(sensorThread_wa),
+                                     NORMALPRIO + 10, sensor_task, NULL);
+}
+
+void sensor_stop()
+{
+    if (sensorThread)
+    {
+        chThdTerminate(sensorThread);
+        chThdWait(sensorThread);
+        sensorThread = NULL;
+    }
+}
